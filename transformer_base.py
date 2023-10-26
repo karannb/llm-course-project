@@ -2,23 +2,17 @@
 Base Transformer module based on 
 the paper "Attention is All You Need" 
 by Vaswani et al.
-AND a lot of help from 
+AND a some help from 
 https://www.youtube.com/watch?v=kCc8FmEb1nY
-
-IMPORTANT NOTE : my model does a forward pass on all but the **last token**
-                 and then targets are set to all but the **first token**, this
-                 is **different** from the paper and the original implementation,
-                 it just made life easier for me.
-                 (workaround -> just set cur_bs = bs from the paper + 1)
 '''
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sentencepiece as spm
+tokenizer = spm.SentencePieceProcessor('tokenizer/tweets-16.model')
 
 from transformers.activations import ACT2FN
-
-from sentencepiece import SentencePieceProcessor
 
 import math
 
@@ -79,10 +73,15 @@ class MultiHeadAttention(nn.Module):
         k = self.transpose_for_scores(self.k_proj(x)) #same
         v = self.transpose_for_scores(self.v_proj(x)) #same
 
-        x = torch.matmul(q, k.transpose(-2, -1))/math.sqrt(self.head_dim) #(bs, heads, seq_len, head_dim)
+        x = torch.matmul(q, k.transpose(-2, -1))/math.sqrt(self.head_dim) #(bs, heads, seq_len, seq_len)
+
         if mask != None:
-            x = x.masked_fill(mask == 1, -1e9)
+            x = x.masked_fill(mask == 1, -float('inf'))
+
         x = F.softmax(x, dim=-1) #attention weights, (bs, heads, seq_len, seq_len)
+
+        nans = torch.isnan(x).to(x.device)
+        x = x.masked_fill(nans == 1, 0)
 
         x = self.dropout(x) # this might seem weird but is from the paper
 
@@ -130,27 +129,28 @@ class TransfomerBlock(nn.Module):
         '''
         Attention -> Add & Norm -> Feed Forward -> Add & Norm.
 
+        NOTE : different from the original paper, PRE-NORM formulation
+
         params:
             x : torch.Tensor
                 input tensor of shape (batch_size, seq_len, hidden_dim)
             mask : torch.Tensor
                 mask tensor of shape (batch_size, seq_len, seq_len)
         '''
-        attn_output = self.attn(x, mask)
-        x = x + self.norm1(attn_output)
+        x = x + self.attn(self.norm1(x), mask)
 
-        fc = self.activation(self.fc1(x))
+        fc = self.activation(self.fc1(self.norm2(x)))
         fc = self.activation(self.fc2(fc))
 
-        x = x + self.fc_dropout(self.norm2(fc))
+        x = x + self.fc_dropout(fc)
 
         return x
     
 class Decoder(nn.Module):
 
-    def __init__(self, vocab_size, context_length, num_layers : int = 4, hidden_dim : int = 128, 
-                 heads : int = 4, attn_dropout : float = 0.1, fc_dropout : float = 0.1, 
-                 activation : str = 'gelu'):
+    def __init__(self, vocab_size, context_length, device, num_layers : int = 4, 
+                 hidden_dim : int = 128, heads : int = 4, attn_dropout : float = 0.1, 
+                 fc_dropout : float = 0.1, activation : str = 'gelu', return_last_state : bool = True):
         '''
         Initializes a Decoder module.
         params:
@@ -174,209 +174,144 @@ class Decoder(nn.Module):
 
         super(Decoder, self).__init__()
 
+        self.device = device
         self.vocab_size = vocab_size
-        self.context_length = context_length
+        self.context_length = context_length-1 # -1 because I do NOT use the last token in the window and predict that
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
-        self.word_embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.pos_embedding = nn.Embedding(context_length, hidden_dim) #not sinusoids because same results either way
+        self.word_embedding = nn.Embedding(vocab_size, hidden_dim, padding_idx=-1)
+        self.pos_embedding = nn.Embedding(context_length-1, hidden_dim) #not sinusoids because same results either way
         
         self.layers = nn.ModuleList([TransfomerBlock(hidden_dim, heads, attn_dropout, fc_dropout, activation) for _ in range(num_layers)])
 
         self.ln_final = nn.LayerNorm(hidden_dim)
 
-    def get_causal_mask(self, x : torch.Tensor):
-        '''
-        Returns a causal mask (seq_len x seq_len) for the input.
-        params:
-            x : torch.Tensor
-                input tensor of shape (batch_size, seq_len, hidden_dim)
-        '''
+        self.lm_head = nn.Linear(hidden_dim, vocab_size)
 
-        mask = torch.triu(torch.ones(x.shape[1], x.shape[1]), diagonal=1).bool()
+        print(f"Instantiated model has {self.get_params()/1e6 :.4f}M parameters", flush=True)
+        self.to(device)
+
+    def get_params(self):
+
+        params = sum([p.numel() for p in self.parameters() if p.requires_grad])
+        return params
+
+    def get_mask(self, text : torch.Tensor):
+        '''
+        Returns a causal (seq_len x seq_len) for the input.
+        params:
+            text : torch.Tensor
+                input tensor of shape (batch_size, seq_len)
+        '''
+        
+        causal_mask = torch.triu(torch.ones(text.shape[1], text.shape[1]), diagonal=1).type(torch.bool).to(self.device) #seq_len x seq_len
+        pad_mask = (text == tokenizer.pad_id()).to(self.device) #batch x seq_len
+        mask = pad_mask[:, :, None].expand(-1, -1, text.shape[1])
+        mask = mask.masked_fill(causal_mask, 1)
+        mask = mask[:, None, :, :].to(self.device) #make it broadcastable along num_heads
+
         return mask
 
-    def forward(self, x : torch.Tensor, mask : torch.Tensor = None):
+    def forward(self, 
+                text : torch.Tensor, 
+                eval : bool = False,
+                finetune : bool = False):
         '''
         Forward call for the Decoder module.
         params:
-            x : torch.Tensor
+            text : torch.Tensor
                 input tensor of shape (batch_size, seq_len)
-            mask : torch.Tensor
-                mask tensor of shape (batch_size, seq_len, seq_len)
         '''
 
-        x = self.word_embedding(x) + self.pos_embedding(torch.arange(x.shape[1], device=x.device))
+        ip_text = text[:, :-1]
 
-        if mask is None:
-            mask = self.get_causal_mask(x)
+        if eval or finetune:
+            ip_text = text #otherwise return [bs, 0, vocab_size] 
+
+        targets = text[:, 1:]
+
+        x = self.word_embedding(ip_text) + self.pos_embedding(torch.arange(ip_text.shape[1], device=text.device))
+
+        mask = self.get_mask(ip_text).to(self.device)
         
-        for layer in self.layers:
+        last_hid = None
+
+        for i, layer in enumerate(self.layers):
             x = layer(x, mask)
 
-        x = self.ln_final(x)
+            if i == self.num_layers - 1:
+                last_hid = x[:, -1, :] #the extract token
 
-        return x
+        logits = self.lm_head(self.ln_final(x))
 
-class GPTConfig:
-    vocab_size: int = 16000
-    context_length: int = 64
-    num_layers: int = 4
-    hidden_dim: int = 128
-    heads: int = 4
-    attn_dropout: float = 0.1
-    fc_dropout: float = 0.1
-    activation: str = 'gelu'
-    task : str = 'generation'
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-class GPT(nn.Module):
-    
-    def __init__(self, config : GPTConfig):
-        '''
-        Why an extra GPT apart from a decoder?
-        I add some extra code to tokenize the text, generation and fine-tuning.
-        params:
-            config : GPTConfig
-                configuration for the GPT module
-        '''
-        super(GPT, self).__init__()
-
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        self.config = config
-
-        self.sp = SentencePieceProcessor("tokenizer/tweets.model")
-
-        self.transformer = Decoder(config.vocab_size, config.context_length, config.num_layers, config.hidden_dim, 
-                                   config.heads, config.attn_dropout, config.fc_dropout, config.activation)
-        
-        self.head = nn.Linear(config.hidden_dim, config.vocab_size)
-        # For Classification on SST2 (Stanford Sentiment Treebank 2)
-        if config.task == 'classification':
-            self.classifier = nn.Linear(config.hidden_dim*config.context_length, 1)
-
-        # For Semantic Similarity on STS Benchmark (Semantic Textual Similarity Benchmark)
-        elif config.task == 'similarity':
-            self.similarier = nn.Linear(config.hidden_dim*config.context_length, 1) # xD
-        
-        print(f"Number of parameters in the currently instantiated model (total) ~ {self.get_num_params(non_embedding=False)/1e6 :.2f}M")
-        print(f"Number of parameters in the currently instantiated model (without embeddings) ~ {self.get_num_params()/1e6 :.2f}M")
-
-    def get_num_params(self, non_embedding=True): #from <https://github.com/karpathy/nanoGPT/blob/master/model.py>
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.pos_embedding.weight.numel()
-        return n_params
-    
-    def tokenize(self, text):
-        '''
-        Tokenizes the text using the Sentencepiece tokenizer.
-        params:
-            text : str
-                text to tokenize
-        '''
-        
-        return torch.tensor([self.sp.encode(text)], dtype=torch.long, device=self.device)
-    
-    def forward(self, text, targets=None, finetuning=False):
-        '''
-        params:
-            text : str
-                text to generate from, shape (batch_size, seq_len)
-                tuple for similarity task, shape (2, batch_size, seq_len)
-            targets : any
-                during fine-tuning -> labels, shape (batch_size, 1)
-        '''
-        if self.config.task == 'similarity':
-            assert text.shape[0] == 2, "For similarity task, text must be a tuple of two sentences."
-
-        text = self.tokenize(text)
-
-        assert text.shape[1] <= self.config.context_length, f"Text length {text.shape[1]} is greater than context length {self.config.context_length}."
-
-        if not finetuning:
-            logits = self.transformer(text[:, :-1])
-
+        if not eval and not finetune: 
+            loss = F.cross_entropy(logits.view(-1, self.vocab_size), targets.reshape(-1)) #(Batch*Context, vocab_size) -> logit and (Batch*Context,) -> targets
         else:
-            logits = self.transformer(text)
+            if finetune: #Auxiliary loss
+                loss = F.cross_entropy(logits[:, :-1, :].reshape(-1, self.vocab_size), targets.reshape(-1))
+            else:
+                loss = None
 
-        pred = self.head(logits)
-        #print(text, logits.shape, pred.shape)
+        return loss, logits, last_hid
+    
+    def generate(self, max_tokens : int = 20, num_beams : int = 4, text = None):
 
-        if not finetuning:
-            targets = text[:, 1:].contiguous()
-            loss = F.cross_entropy(pred.view(-1, pred.size(-1)), targets.view(-1))
-
-        elif finetuning:
-            aux_targets = text[:, 1:].contiguous()
-
-            if self.config.task == 'classification':
-                classes = self.classifier(logits.view(logits.size(0), -1))
-                loss = F.binary_cross_entropy_with_logits(classes, targets.squeeze(1)) + (0.5)*F.cross_entropy(logits[:, :-1].view(-1, logits.size(-1)), aux_targets.view(-1))
-
-            elif self.config.task == 'similarity':
-                #FIXME: this is not the way to do this
-                similarity = self.similarier(logits.view(logits.size(0), -1))
-                loss = F.binary_cross_entropy_with_logits(similarity, targets.squeeze(1)) + (0.5)*F.cross_entropy(logits.view(-1, logits.size(-1)), aux_targets.view(-1))
-                
+        self.eval()
+        if text == None:
+            text = torch.ones((num_beams, 1)).to(self.device, dtype=torch.long) #torch.ones(*) because SentencePiece encodes <s> to 1
         else:
-            # inference time
-            logits = logits[:, -1, :]
-            loss = None
-        
-        return logits, loss
-    
-    def configure_optimizers(self, weight_decay : int = 1e-1, learning_rate : int = 3e-4, betas : tuple = (0.9, 0.95)): #again from <https://github.com/karpathy/nanoGPT/blob/master/model.py>
+            text = torch.tensor(tokenizer.EncodeAsIds(text)).reshape(1, -1).to(self.device, dtype=torch.long)
+            text = text.expand((num_beams, -1))
 
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-
-        return optimizer
-    
-    def generate(self, text, top_k : int = None, max_new_tokens : int = 10):
-        '''
-        Finally, Generates text from the model!
-        '''
-        self.transformer.eval()
-        idx = self.tokenize(text)
-
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.context_length:]
-
-            logits, _ = self(idx_cond)
-
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+        for _ in range(max_tokens):
             
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            if text.shape[1] > self.context_length:
+                text = text[:,-self.context_length:]
 
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            _, logits, _ = self(text, eval=True)
+
+            logits = logits[:, -1, :] #pick last generated token
+
+            probs = F.softmax(logits, dim=-1) #create a probability distribution
+
+            next_tokens = torch.multinomial(probs, num_samples=1) #sample!
+
+            text = torch.concat([text, next_tokens], dim=1) #append for next pass
+
+        return text.tolist()
+    
+#if __name__ == "__main__":
+    # model = Decoder(16000, 65, 'cpu')
+    # saved = torch.load('state_dicts/context-65-lr-0.0003.pth', map_location='cpu')
+    # model.load_state_dict(saved)
+    # model.eval()
+    # print("Model loaded!")
+    # text_ids = model.generate(text='Hello what\'s up')
+    # for text in text_ids:
+    #     print(tokenizer.DecodeIds(text))
+
+    # model = Decoder(16000, 65, 'cpu')
+    # model.load_state_dict(torch.load('state_dicts/finetuned-sentence-similarity-run-93-aux-0.75-lr-0.0006.pth'))
+    # network = nn.Sequential(
+    #     nn.Linear(model.hidden_dim, 2*model.hidden_dim),
+    #     nn.ReLU(inplace=True),
+    #     nn.Linear(2*model.hidden_dim, 1)
+    # )
+    # network.load_state_dict(torch.load('state_dicts/weight-finetuned-sentence-similarity-run-93-aux-0.75-lr-0.0006.pth'))
+
+    # model.eval()
+    # network.eval()
+    # sentence1 = 'A person is flying the kite.'
+    # sentence2 = 'Someone is flying a kite.'
+
+    # sentences = torch.tensor(tokenizer.EncodeAsIds(sentence1 + sentence2)).reshape(1, -1)
+    # sentences_T = torch.tensor(tokenizer.EncodeAsIds(sentence2 + sentence1)).reshape(1, -1) 
+    # # Have to encode both ways because the model isn't normalized and only gives
+    # # half a score if only one sentence is present
+    # _, _, hid1 = model(sentences, finetune=True)
+    # _, _, hid2 = model(sentences_T, finetune=True)
+
+    # logit = hid1 + hid2
+
+    # print(f"Similarity Score is : {network(logit).item() :.3f}")
